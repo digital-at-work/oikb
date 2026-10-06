@@ -43,12 +43,29 @@ def _make_client(url: str | None, token: str | None):
     )
 
 
-def _resolve_connector(source: str, branch: str | None = None, path: str | None = None):
-    """Resolve a source string to the appropriate connector."""
+def _resolve_connector(
+    source: str,
+    branch: str | None = None,
+    path: str | None = None,
+    auth: dict[str, Any] | None = None,
+):
+    """Resolve a source string to the appropriate connector.
+
+    `auth` carries source-specific credentials — token, client_id,
+    client_secret, tenant_id, base_url, whatever a given connector's
+    constructor accepts — sourced from an .oikb.yaml `auth:` block or
+    the CLI's --auth flag. This function stays agnostic about what any
+    one connector needs: it just forwards the dict as **auth and lets
+    the connector's own __init__ validate it (and fall back to its env
+    vars when a key is missing, same as today). An unsupported key
+    surfaces as a normal TypeError naming the bad field.
+    """
+    auth = auth or {}
+
     if source.startswith("github:"):
         from oikb.connectors.github import GitHubConnector, parse_github_source
         parsed = parse_github_source(source)
-        return GitHubConnector(owner=parsed["owner"], repo=parsed["repo"], branch=branch, path=path or parsed.get("path"))
+        return GitHubConnector(owner=parsed["owner"], repo=parsed["repo"], branch=branch, path=path or parsed.get("path"), **auth)
 
     if source.startswith("gitlab:"):
         from oikb.connectors.gitlab import GitLabConnector, parse_gitlab_source
@@ -59,6 +76,7 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
             branch=branch,
             path=path or parsed.get("path"),
             is_wiki=bool(parsed.get("wiki")),
+            **auth,
         )
 
     if source.startswith("s3://"):
@@ -89,7 +107,14 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
     if source.startswith("confluence:"):
         from oikb.connectors.confluence import ConfluenceConnector, parse_confluence_source
         parsed = parse_confluence_source(source)
-        return ConfluenceConnector(space_key=parsed["space_key"], base_url=parsed.get("base_url"))
+        return ConfluenceConnector(
+            space_key=parsed["space_key"],
+            base_url=auth.get("base_url") or parsed.get("base_url"),
+            user=auth.get("user"),
+            token=auth.get("token"),
+            api_version=auth.get("api_version"),
+            structure=parsed.get("structure", "flat"),
+        )
 
     if source.startswith("notion:"):
         from oikb.connectors.notion import NotionConnector, parse_notion_source
@@ -116,7 +141,7 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
     if source.startswith("sharepoint:"):
         from oikb.connectors.sharepoint import SharePointConnector, parse_sharepoint_source
         parsed = parse_sharepoint_source(source)
-        return SharePointConnector(site=parsed["site"], library=parsed.get("library", "Documents"))
+        return SharePointConnector(site=parsed["site"], site_path=parsed["site_path"], library=parsed.get("library", "Documents"), **auth)
 
     if source.startswith("nextcloud:"):
         from oikb.connectors.nextcloud import NextcloudConnector, parse_nextcloud_source
@@ -131,7 +156,7 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
     if source.startswith("bitbucket:"):
         from oikb.connectors.bitbucket import BitbucketConnector, parse_bitbucket_source
         parsed = parse_bitbucket_source(source)
-        return BitbucketConnector(owner=parsed["owner"], repo=parsed["repo"], branch=branch, path=path or parsed.get("path"))
+        return BitbucketConnector(owner=parsed["owner"], repo=parsed["repo"], branch=branch, path=path or parsed.get("path"), **auth)
 
     if source.startswith("discord:"):
         from oikb.connectors.discord import DiscordConnector, parse_discord_source
@@ -290,7 +315,7 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
     if source.startswith("zotero:"):
         from oikb.connectors.zotero import ZoteroConnector, parse_zotero_source
         parsed = parse_zotero_source(source)
-        return ZoteroConnector(hierarchy=parsed.get("hierarchy"))
+        return ZoteroConnector(hierarchy=parsed.get("hierarchy"), library_id=parsed.get("library_id"))
 
     # Default: local filesystem.
     from oikb.connectors.filesystem import FilesystemConnector
@@ -368,6 +393,27 @@ def _build_cli_filter(max_file_size: str | None):
     return build_manifest_filter(max_size=parse_size(max_file_size))
 
 
+def _parse_auth_option(pairs: tuple[str, ...]) -> dict[str, str]:
+    """Turn repeated --auth key=value flags into a credentials dict.
+
+    Mirrors the shape of an .oikb.yaml `auth:` block so single-source
+    CLI invocations (no .oikb.yaml) can also authenticate connectors
+    like gitlab/github/sharepoint/bitbucket without env vars.
+    """
+    auth: dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise click.BadOptionUsage(
+                "auth", f"--auth expects key=value, got: {pair!r}"
+            )
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if not key:
+            raise click.BadOptionUsage("auth", f"--auth expects key=value, got: {pair!r}")
+        auth[key] = value
+    return auth
+
+
 # ── sync ────────────────────────────────────────────────────────
 
 @cli.command()
@@ -380,6 +426,14 @@ def _build_cli_filter(max_file_size: str | None):
 @click.option("--name", default=None, help="Target a specific entry in .oikb.yaml by name/kb-id.")
 @click.option("--concurrency", default=1, type=int, help="Parallel upload workers (default: 1, sequential).")
 @click.option("--max-file-size", default=None, help="Skip files larger than this (e.g. 50mb, 1gb).")
+@click.option(
+    "--auth",
+    "auth_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Source credential, repeatable (e.g. --auth token=... --auth base_url=...). "
+    "Ignored in .oikb.yaml mode — use each entry's own auth: block instead.",
+)
 @click.pass_context
 def sync(
     ctx: click.Context,
@@ -394,6 +448,7 @@ def sync(
     name: str | None,
     concurrency: int,
     max_file_size: str | None,
+    auth_pairs: tuple[str, ...],
 ):
     """Incremental sync from a source to a Knowledge Base.
 
@@ -413,54 +468,33 @@ def sync(
             )
             sys.exit(1)
 
-        # Filter by --name if specified.
+        from oikb.kb_sync import group_entries_by_kb, run_entries_sync
+
+        try:
+            groups = group_entries_by_kb(entries)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
         if name:
-            entries = [e for e in entries if e.get("name") == name or e.get("kb-id") == name]
-            if not entries:
-                click.echo(click.style(f"No entry matching '{name}' in .oikb.yaml", fg="red"), err=True)
-                sys.exit(1)
+            groups = [group for group in groups if any(
+                e.get("name") == name or e["kb-id"] == name for e in group
+            )]
+            if not groups:
+                raise click.ClickException(f"No entry matching '{name}' in .oikb.yaml")
 
         has_errors = False
-        for entry in entries:
-            entry_source = entry.get("source")
-            entry_kb = entry.get("kb-id")
-            entry_branch = entry.get("branch")
-            entry_path = entry.get("path")
-            entry_filter = entry.get("filter", {})
-
-            if not entry_source or not entry_kb:
-                click.echo(click.style(f"Skipping invalid entry (needs source + kb-id): {entry}", fg="yellow"), err=True)
-                continue
-
+        for group in groups:
+            entry = group[0]
+            client = None
             try:
-                connector = _resolve_connector(entry_source, entry_branch, entry_path)
-                client = _make_client(url, token)
-
+                client = _make_client(url or entry.get("url"), token or entry.get("token"))
                 if not quiet:
                     click.echo(f"\n{'─' * 40}")
-                    click.echo(f"Syncing: {entry_source} → {entry_kb}")
+                    click.echo(f"Syncing: {', '.join(e['source'] for e in group)} → {entry['kb-id']}")
 
-                mf = None
-                inc = entry_filter.get("include")
-                exc = entry_filter.get("exclude")
-                ms = entry_filter.get("max-size") or max_file_size
-                if inc or exc or ms:
-                    from oikb.sync import build_manifest_filter, parse_size
-                    mf = build_manifest_filter(
-                        include=inc,
-                        exclude=exc,
-                        max_size=parse_size(ms),
-                    )
-
-                result = run_sync(
-                    client=client,
-                    connector=connector,
-                    kb_id=entry_kb,
-                    dry_run=dry_run,
-                    verbose=verbose,
-                    quiet=quiet,
-                    manifest_filter=mf,
-                    concurrency=entry.get("concurrency", concurrency),
+                result = run_entries_sync(
+                    client, group, resolve_connector=_resolve_connector,
+                    dry_run=dry_run, verbose=verbose, quiet=quiet,
+                    concurrency=concurrency, max_file_size=max_file_size,
                 )
 
                 if not quiet:
@@ -485,11 +519,12 @@ def sync(
                 if result.errors:
                     has_errors = True
 
-                client.close()
-
             except Exception as e:
                 click.echo(click.style(f"  Failed: {e}", fg="red"), err=True)
                 has_errors = True
+            finally:
+                if client:
+                    client.close()
 
         if has_errors:
             sys.exit(1)
@@ -501,7 +536,7 @@ def sync(
         sys.exit(1)
 
     try:
-        connector = _resolve_connector(source, branch, source_path)
+        connector = _resolve_connector(source, branch, source_path, auth=_parse_auth_option(auth_pairs))
     except (FileNotFoundError, ImportError, ValueError) as e:
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -554,6 +589,13 @@ def sync(
 @click.option("--branch", default=None, help="Branch for GitHub sources.")
 @click.option("--path", "source_path", default=None, help="Subdirectory within the source.")
 @click.option("-v", "--verbose", is_flag=True, help="Show detailed output.")
+@click.option(
+    "--auth",
+    "auth_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Source credential, repeatable (e.g. --auth token=... --auth base_url=...).",
+)
 @click.pass_context
 def diff(
     ctx: click.Context,
@@ -564,6 +606,7 @@ def diff(
     branch: str | None,
     source_path: str | None,
     verbose: bool,
+    auth_pairs: tuple[str, ...],
 ):
     """Preview what a sync would do (alias for sync --dry-run)."""
     if not kb:
@@ -573,7 +616,7 @@ def diff(
     from oikb.sync import run_sync
 
     try:
-        connector = _resolve_connector(source, branch, source_path)
+        connector = _resolve_connector(source, branch, source_path, auth=_parse_auth_option(auth_pairs))
     except (FileNotFoundError, ImportError, ValueError) as e:
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -758,7 +801,7 @@ def status(url: str | None, token: str | None, kb: str | None):
 
     try:
         info = client.get_kb(kb)
-        files = info.get("files", [])
+        files = client.list_kb_files(kb)
     except Exception as e:
         click.echo(click.style(f"Failed: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -924,9 +967,10 @@ def validate(config_file: str | None, deep: bool):
             has_errors = True
             continue
 
-        # Syntax check: resolve the connector.
+        # Syntax check: resolve the connector (using its configured auth,
+        # since some connectors — e.g. SharePoint — authenticate eagerly).
         try:
-            _resolve_connector(source)
+            _resolve_connector(source, auth=entry.get("auth", {}))
         except Exception as e:
             click.echo(click.style(f"  ✗ {entry_name}: {e}", fg="red"))
             has_errors = True
@@ -937,7 +981,7 @@ def validate(config_file: str | None, deep: bool):
             try:
                 kb = client.get_kb(kb_id)
                 kb_name = kb.get("name", "?")
-                file_count = len(kb.get("files", []))
+                file_count = client.count_kb_files(kb_id)
                 click.echo(
                     click.style(f"  ✓ {entry_name}", fg="green")
                     + f"  {source} → {kb_name} ({file_count} files)"
@@ -985,7 +1029,7 @@ def daemon(port: int, no_server: bool, config_file: str | None, log_format: str 
         entries = _load_oikb_yaml()
 
     if not entries:
-        click.echo(click.style("No sync entries found. Create a .oikb.yaml file.", fg="red"), err=True)
+        click.echo(click.style("No sync entries found. Create a .oikb.yaml file at {yaml_path}.", fg="red"), err=True)
         sys.exit(1)
 
     # Validate entries.

@@ -467,10 +467,17 @@ def _run_sync_inner(
             return ("error", f"File not in manifest: {display}")
 
         last_err: Exception | None = None
+        last_status: int | None = None
         for attempt in range(3):
             check_stop()
             try:
                 content = connector.read_file(path, filename)
+                if not content:
+                    if progress is not None:
+                        progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
+                    else:
+                        click.echo(click.style(f"  ⚠ {display}: empty content, skipping", fg="yellow"), err=True)
+                    return ("warning", f"{display}: empty content, skipping")
                 check_stop()
                 directory_id = directory_map.get(path) if path else None
                 resp = client.upload_file(
@@ -498,28 +505,33 @@ def _run_sync_inner(
                     click.echo(click.style(f"  ⚠ {message}", fg="yellow"), err=True)
                 return ("warning", message)
             except httpx.HTTPStatusError as e:
+                last_status = e.response.status_code
                 if e.response.status_code >= 500 and attempt < 2:
                     time.sleep(2 ** attempt)
                     check_stop()
                     last_err = e
                     continue
-                last_err = e
+                detail = e.response.text.strip()
+                try:
+                    payload = e.response.json()
+                    if isinstance(payload, dict) and payload.get("detail"):
+                        detail = str(payload["detail"])
+                except ValueError:
+                    pass
+                last_err = RuntimeError(f"{e} — {detail}") if detail else e
                 break
             except SyncCancelled:
                 raise
             except Exception as e:
                 last_err = e
+                last_status = None
                 break
 
         if progress is not None:
             progress.update(task_id, advance=1, description=f"[red]✗ {display}[/red]")
         else:
             click.echo(click.style(f"  ✗ {display}: {last_err}", fg="red"), err=True)
-        if (
-            history is not None
-            and isinstance(last_err, httpx.HTTPStatusError)
-            and last_err.response.status_code in _PERMANENT_UPLOAD_STATUSES
-        ):
+        if history is not None and last_status in _PERMANENT_UPLOAD_STATUSES:
             history.record_failure(
                 kb_id, path, filename, manifest_entry.checksum, str(last_err)
             )

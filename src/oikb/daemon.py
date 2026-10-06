@@ -240,7 +240,7 @@ async def _send_notification(entry: dict, payload: dict) -> None:
 
 
 async def _run_entry(entry: dict, dry_run: bool = False) -> dict | None:
-    """Run a single sync for an entry.
+    """Sync every configured source sharing this entry's KB.
 
     Uses a per-KB lock to prevent overlapping syncs to the same
     Knowledge Base (e.g. webhook fires while a scheduled sync is running).
@@ -263,53 +263,30 @@ async def _run_entry(entry: dict, dry_run: bool = False) -> dict | None:
 async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
     """Inner sync logic, called under the per-KB lock."""
     from oikb.cli import _make_client, _resolve_connector
-    from oikb.sync import SyncCancelled, run_sync
+    from oikb.kb_sync import run_entries_sync
+    from oikb.sync import SyncCancelled
 
-    source = entry["source"]
+    entries = [e for e in _entries if e.get("kb-id") == entry["kb-id"]] or [entry]
+    source = ", ".join(e["source"] for e in entries)
     kb_id = entry["kb-id"]
     started_at = time.time()
     client = None
 
-    _scheduler_state[source] = {
-        **_scheduler_state.get(source, {}),
-        "name": entry.get("name", source),
-        "status": "running",
-        "started_at": started_at,
-    }
+    def set_state(**state):
+        for member in entries:
+            _scheduler_state[member["source"]] = {
+                "name": member.get("name", member["source"]), **state,
+            }
+
+    if not dry_run:
+        set_state(status="running", started_at=started_at)
 
     try:
-        connector = _resolve_connector(
-            source,
-            branch=entry.get("branch"),
-            path=entry.get("path"),
-        )
-        client = _make_client(
-            url=entry.get("url"),
-            token=entry.get("token"),
-        )
-
-        mf = None
-        entry_filter = entry.get("filter", {})
-        inc = entry_filter.get("include")
-        exc = entry_filter.get("exclude")
-        ms = entry_filter.get("max-size")
-        if inc or exc or ms:
-            from oikb.sync import build_manifest_filter, parse_size
-            mf = build_manifest_filter(
-                include=inc,
-                exclude=exc,
-                max_size=parse_size(ms),
-            )
-
+        client = _make_client(url=entry.get("url"), token=entry.get("token"))
         result = await asyncio.to_thread(
-            run_sync,
-            client=client,
-            connector=connector,
-            kb_id=kb_id,
-            dry_run=dry_run,
-            quiet=True,
-            manifest_filter=mf,
-            concurrency=entry.get("concurrency", 1),
+            run_entries_sync,
+            client, entries, resolve_connector=_resolve_connector,
+            dry_run=dry_run, quiet=True,
             cancel_requested=_shutdown_event.is_set if _shutdown_event else None,
             history=_history,
         )
@@ -331,18 +308,12 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
         duration_ms = int(duration_s * 1000)
         status = "success" if not result.errors else "partial"
 
-        _scheduler_state[source] = {
-            "name": entry.get("name", source),
-            "status": status,
-            "last_sync": time.time(),
-            "duration_ms": duration_ms,
-            "files_added": result.added,
-            "files_modified": result.modified,
-            "files_deleted": result.deleted,
-            "unmodified": result.unmodified,
-            "warnings": result.warnings or [],
-            "errors": result.errors or [],
-        }
+        set_state(
+            status=status, last_sync=time.time(), duration_ms=duration_ms,
+            files_added=result.added, files_modified=result.modified,
+            files_deleted=result.deleted, unmodified=result.unmodified,
+            warnings=result.warnings or [], errors=result.errors or [],
+        )
 
         record_sync(
             source=source,
@@ -371,34 +342,26 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
             f"Synced {source} -> {kb_id}: {result.summary()} ({duration_ms}ms)"
         )
 
-        await _send_notification(entry, {
-            "source": source,
-            "kb_id": kb_id,
-            "status": status,
-            "duration_ms": duration_ms,
-            "summary": result.summary(),
-            "files_added": result.added,
-            "files_modified": result.modified,
-            "files_deleted": result.deleted,
-            "warnings": result.warnings or [],
-            "errors": result.errors or [],
-        })
+        for member in entries:
+            await _send_notification(member, {
+                "source": source,
+                "kb_id": kb_id,
+                "status": status,
+                "duration_ms": duration_ms,
+                "summary": result.summary(),
+                "files_added": result.added,
+                "files_modified": result.modified,
+                "files_deleted": result.deleted,
+                "warnings": result.warnings or [],
+                "errors": result.errors or [],
+            })
 
     except SyncCancelled:
-        _scheduler_state[source] = {
-            "name": entry.get("name", source),
-            "status": "cancelled",
-            "last_sync": time.time(),
-        }
+        set_state(status="cancelled", last_sync=time.time())
         log.info(f"Sync cancelled for {source}")
 
     except Exception as e:
-        _scheduler_state[source] = {
-            "name": entry.get("name", source),
-            "status": "error",
-            "last_sync": time.time(),
-            "error": str(e),
-        }
+        set_state(status="error", last_sync=time.time(), error=str(e))
         record_sync(
             source=source,
             status="error",
@@ -415,12 +378,13 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
             )
         log.error(f"Sync failed for {source}: {e}")
 
-        await _send_notification(entry, {
-            "source": source,
-            "kb_id": kb_id,
-            "status": "error",
-            "error": str(e),
-        })
+        for member in entries:
+            await _send_notification(member, {
+                "source": source,
+                "kb_id": kb_id,
+                "status": "error",
+                "error": str(e),
+            })
     finally:
         if client:
             client.close()
@@ -495,6 +459,8 @@ def start_daemon(
     from oikb.logging import configure_logging
     configure_logging(log_format=log_format)
 
+    from oikb.kb_sync import group_entries_by_kb
+    group_entries_by_kb(entries)  # Validate shared destinations before starting tasks.
     _entries = entries
     _history = SyncHistory()
     set_build_info(__version__)

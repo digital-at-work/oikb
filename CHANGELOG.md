@@ -14,6 +14,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`oikb failures` command**: list uploads that were permanently rejected by the server (`--kb-id` to filter, `--clear` to forget the records and retry them on the next sync, `--json` for machine-readable output).
 
+## [0.5.0] - 2026-09-16
+
+### Added
+
+- **Multiple sources in one Knowledge Base**: combine sources such as a Confluence space and a local handbook without one sync deleting the other's files. Sources listed together in the same configuration are synced as a group, including scheduled runs and updates triggered by source changes. You can choose a destination folder for each source to keep matching filenames separate.
+- **Confluence Server and Data Center**: sync spaces from self-hosted Confluence, including installations under an address such as `/confluence`. Sign in with a personal access token, and use Cloud and Data Center sources together with separate connection settings.
+- **Confluence page folders**: optionally preserve parent and child pages as folders, so you can include or exclude a whole section, such as Engineering runbooks.
+- **SharePoint sites**: sync document libraries from team sites and nested subsites, in addition to the main site.
+- **SharePoint government clouds**: connect to Microsoft GCC High and Department of Defense environments.
+- **Multiple Zotero libraries**: sync more than one personal or group library from one configuration, with separate access keys, collection choices, notes, annotations, and PDF download settings for each library.
+- **Separate source sign-ins**: supply credentials for GitHub, GitLab, Bitbucket, SharePoint, and Confluence individually in the configuration or when running a sync or preview. This lets one setup access sources that require different accounts.
+
+### Fixed
+
+- **Google Drive subfolders**: files inside nested folders are now included instead of being silently skipped.
+- **Large Outline collections**: syncing continues past the first 100 documents instead of leaving the rest out.
+- **Zotero collection selection**: selecting a named collection or subcollection now finds it correctly when its top-level collection has no parent.
+- **SharePoint filenames**: files and folders containing characters such as `#` or `%` can now be found and downloaded.
+- **SharePoint certificate sign-in**: valid certificates no longer fail with a "key was not found" error caused by how oikb identifies the certificate.
+- **GitHub and GitLab access**: syncs now use the credentials supplied for each source instead of ignoring them. Configuration checks also use the supplied source credentials.
+- **Confluence space selection**: spaces can be selected by their short names, such as `ENG`, without looking up a numeric space ID. Cloud addresses that already end in `/wiki` are accepted.
+- **Confluence page content**: text inside macros and code blocks is retained, including code indentation and line breaks. Blank pages and pages containing only an automatic index are skipped with a warning instead of repeatedly failing to upload.
+- **Confluence matching titles**: pages whose titles produce the same filename now receive distinct names, so one page does not replace another.
+- **Confluence large spaces**: page lists continue correctly when Confluence limits the number returned at once. If the list cannot be completed, the sync stops before changing the Knowledge Base.
+- **Knowledge Base file listings**: file listing and status commands now read the dedicated file list, avoiding failures when the Knowledge Base summary contains no file details. Connection checks read the reported total file count.
+- **Empty files**: empty content is skipped with a warning instead of being sent for upload.
+- **Upload errors**: failures now include the reason returned by Open WebUI, such as a text extraction failure.
+
+### Changed
+
+- **Shared Knowledge Base setup**: list all sources for the same Knowledge Base in one configuration. Selecting any one of those sources syncs the whole group. Running a standalone sync for just one source does not protect files from the others. Preview changes before combining existing sources, since destination folders can move files.
+- **Contributor credits**: added explicit credit for thiswillbeyourgithub's Zotero work and hexsm's BookStack export work already included in 0.4.0.
+
 ## [0.4.0] - 2026-07-17
 
 ### Added
